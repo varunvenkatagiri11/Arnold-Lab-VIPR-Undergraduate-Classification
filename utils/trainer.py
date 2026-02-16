@@ -569,7 +569,7 @@ def print_final_results(results):
 # ---------------------------------------------------------------------------
 
 
-def train_model(options):
+def train_model(options, trial=None, results_dir_override=None):
     """
     Run a complete training experiment.
 
@@ -578,6 +578,12 @@ def train_model(options):
 
     Args:
         options: Complete configuration dictionary
+        trial: Optional Optuna trial for pruning support. If provided,
+               reports validation accuracy after each epoch and checks
+               for pruning. Raises optuna.TrialPruned if pruned.
+        results_dir_override: Optional path to override default results
+                             directory. Used by Optuna to place trial
+                             results in study-specific directories.
 
     Returns:
         dict: Summary of results including accuracies and timing
@@ -596,8 +602,12 @@ def train_model(options):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Device] {device}")
 
-    # Results directory
-    results_dir = create_results_dir(experiment_name)
+    # Results directory (allow override for Optuna)
+    if results_dir_override:
+        results_dir = Path(results_dir_override)
+        results_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        results_dir = create_results_dir(experiment_name)
     save_config(options, results_dir)
     metrics_path = init_metrics_file(results_dir)
 
@@ -652,6 +662,13 @@ def train_model(options):
         )
 
         val_metrics = evaluate(model, val_loader, criterion, device)
+
+        # Optuna pruning check
+        if trial is not None:
+            trial.report(val_metrics["acc_top1"], epoch)
+            if trial.should_prune():
+                import optuna
+                raise optuna.TrialPruned()
 
         current_lr = optimizer.param_groups[0]["lr"]
         is_best = early_stopping.step(val_metrics["acc_top1"])

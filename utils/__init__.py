@@ -18,3 +18,22 @@ from .visualization import (
     plot_accuracy_comparison,
     plot_model_comparison_bar,
 )
+
+# Optuna utilities (optional, only available when optuna is installed)
+try:
+    from .optuna_utils import (
+        generate_trial_hash,
+        generate_trial_name,
+        sample_hyperparameters,
+        apply_hyperparameters,
+        create_pruner,
+        update_study_summary,
+        cleanup_trials,
+        cleanup_pruned_trial,
+        update_best_model,
+        TrialCleanupCallback,
+        BestModelCallback,
+        StudySummaryCallback,
+    )
+except ImportError:
+    pass
