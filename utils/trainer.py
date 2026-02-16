@@ -19,7 +19,13 @@ from torch.amp.autocast_mode import autocast
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from .model_utils import load_model, count_parameters
+from .model_utils import (
+    load_model,
+    count_parameters,
+    _get_classifier_attr,
+    get_backbone_blocks,
+    thaw_backbone_percentage,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -167,21 +173,61 @@ def create_dataloaders(options):
 # ---------------------------------------------------------------------------
 
 
-def create_optimizer(model, options):
-    """Create optimizer from config."""
+def create_optimizer(model, options, backbone_name=None):
+    """
+    Create optimizer from config with optional discriminative learning rates.
+
+    When backbone_name is provided and thaw_schedule is configured, creates
+    named parameter groups for backbone vs classifier with different LRs.
+    Includes ALL parameters (even frozen ones) to preserve momentum state
+    when thawing layers mid-training.
+
+    Args:
+        model: The model
+        options: Config dict
+        backbone_name: If provided, enables discriminative LR setup
+
+    Returns:
+        torch.optim.Optimizer
+    """
     train_opts = options["training"]
     lr = train_opts["learning_rate"]
     weight_decay = train_opts.get("weight_decay", 0.01)
     optimizer_name = train_opts.get("optimizer", "adamw").lower()
+    thaw_schedule = train_opts.get("thaw_schedule")
 
-    params = filter(lambda p: p.requires_grad, model.parameters())
+    # Use discriminative LR if thaw_schedule is configured
+    if backbone_name and thaw_schedule:
+        backbone_lr_ratio = train_opts.get("backbone_lr_ratio", 0.1)
+        classifier_attr = _get_classifier_attr(backbone_name)
+        classifier = getattr(model, classifier_attr)
+        classifier_param_ids = {id(p) for p in classifier.parameters()}
+
+        # Separate ALL params into groups (frozen backbone params included!)
+        classifier_params = []
+        backbone_params = []
+        for param in model.parameters():
+            if id(param) in classifier_param_ids:
+                classifier_params.append(param)
+            else:
+                backbone_params.append(param)
+
+        param_groups = [
+            {'params': classifier_params, 'lr': lr, 'name': 'classifier'},
+            {'params': backbone_params, 'lr': lr * backbone_lr_ratio, 'name': 'backbone'},
+        ]
+    else:
+        # Original behavior - only trainable params with single LR
+        param_groups = [
+            {'params': list(filter(lambda p: p.requires_grad, model.parameters())), 'lr': lr}
+        ]
 
     if optimizer_name == "adamw":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
     elif optimizer_name == "adam":
-        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+        return torch.optim.Adam(param_groups, weight_decay=weight_decay)
     elif optimizer_name == "sgd":
-        return torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
+        return torch.optim.SGD(param_groups, momentum=0.9, weight_decay=weight_decay)
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
@@ -204,6 +250,23 @@ def create_scheduler(optimizer, options, steps_per_epoch):
         )
     else:
         raise ValueError(f"Unknown scheduler: {scheduler_name}")
+
+
+def check_thaw_schedule(epoch, options):
+    """
+    Check if unfreezing should occur at this epoch.
+
+    Args:
+        epoch: Current epoch number (1-indexed)
+        options: Config dict
+
+    Returns:
+        float or None: Percentage to unfreeze, or None if no change
+    """
+    thaw_schedule = options.get("training", {}).get("thaw_schedule")
+    if not thaw_schedule:
+        return None
+    return thaw_schedule.get(str(epoch))
 
 
 # ---------------------------------------------------------------------------
@@ -523,15 +586,20 @@ def train_model(options):
     # Model
     model = load_model(options)
     model = model.to(device)
+    backbone_name = options['model']['backbone']
 
     # Training components
     criterion = nn.CrossEntropyLoss()
-    optimizer = create_optimizer(model, options)
+    optimizer = create_optimizer(model, options, backbone_name)
     scheduler = create_scheduler(optimizer, options, len(train_loader))
     scaler = GradScaler("cuda")
 
     # Early stopping
     early_stopping = EarlyStopping(patience=patience)
+
+    # Progressive unfreezing state
+    current_thaw_pct = 0.0
+    thaw_schedule = options["training"].get("thaw_schedule")
 
     # Training state
     best_val_acc_top1 = 0.0
@@ -540,6 +608,25 @@ def train_model(options):
 
     # Training loop
     for epoch in range(1, epochs + 1):
+        # Check thaw schedule for progressive unfreezing
+        new_thaw_pct = check_thaw_schedule(epoch, options)
+        if new_thaw_pct is not None and new_thaw_pct > current_thaw_pct:
+            # 1. Thaw backbone blocks (toggle requires_grad)
+            thawed = thaw_backbone_percentage(model, backbone_name, new_thaw_pct)
+            print(f"\n[Epoch {epoch}] Thawed {new_thaw_pct:.0%} of backbone: {thawed}")
+
+            # 2. Update backbone LR in-place (preserves momentum state)
+            if thaw_schedule:
+                base_lr = options['training']['learning_rate']
+                backbone_lr_ratio = options['training'].get('backbone_lr_ratio', 0.1)
+                for group in optimizer.param_groups:
+                    if group.get('name') == 'backbone':
+                        group['lr'] = base_lr * backbone_lr_ratio
+
+            current_thaw_pct = new_thaw_pct
+            total, trainable = count_parameters(model)
+            print(f"  Trainable: {trainable:,} / {total:,}\n")
+
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler, scaler, device
         )
