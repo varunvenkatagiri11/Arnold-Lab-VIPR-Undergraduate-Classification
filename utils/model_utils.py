@@ -259,6 +259,72 @@ def count_parameters(model):
 
 
 # ---------------------------------------------------------------------------
+# Progressive Unfreezing
+# ---------------------------------------------------------------------------
+
+def get_backbone_blocks(model, backbone_name):
+    """
+    Dynamically identify atomic blocks via named_children().
+
+    Returns list ordered from output→input (for thawing order).
+    Blocks closest to the classifier head are first (safest to unfreeze).
+
+    Args:
+        model: The loaded model with classifier attached
+        backbone_name: String identifier for the architecture
+
+    Returns:
+        list[str]: Block names ordered from output to input
+    """
+    classifier_attr = _get_classifier_attr(backbone_name)
+
+    blocks = []
+    for name, module in model.named_children():
+        # Skip classifier head
+        if name == classifier_attr:
+            continue
+        # Keep modules that have parameters
+        if any(p.numel() > 0 for p in module.parameters()):
+            blocks.append(name)
+
+    # Reverse so output layers come first (thaw from output toward input)
+    return list(reversed(blocks))
+
+
+def thaw_backbone_percentage(model, backbone_name, percentage):
+    """
+    Unfreeze a percentage of backbone blocks from output toward input.
+
+    Simply toggles requires_grad=True on target blocks. Should be called
+    with monotonically increasing percentages during training.
+
+    Args:
+        model: The model with frozen backbone
+        backbone_name: String identifier for the architecture
+        percentage: Float 0.0-1.0 indicating fraction to unfreeze
+
+    Returns:
+        list[str]: Names of blocks that were unfrozen
+    """
+    if not 0.0 <= percentage <= 1.0:
+        raise ValueError(f"Thaw percentage must be 0.0-1.0, got {percentage}")
+
+    blocks = get_backbone_blocks(model, backbone_name)
+    if not blocks:
+        return []
+
+    n_to_unfreeze = max(1, int(len(blocks) * percentage))
+    blocks_to_thaw = blocks[:n_to_unfreeze]
+
+    for block_name in blocks_to_thaw:
+        block = getattr(model, block_name)
+        for param in block.parameters():
+            param.requires_grad = True
+
+    return blocks_to_thaw
+
+
+# ---------------------------------------------------------------------------
 # Main Factory Function
 # ---------------------------------------------------------------------------
 

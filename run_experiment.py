@@ -19,7 +19,7 @@ def main():
 
     config_path = sys.argv[1]
 
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         options = json.load(f)
 
     results = train_model(options)
@@ -27,5 +27,5 @@ def main():
     print(f"\nResults saved to: results/{options['experiment_name']}/")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
