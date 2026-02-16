@@ -2,7 +2,14 @@
 Visualization Module
 
 Plotting utilities for training metrics and model comparison.
-Generates publication-quality figures for learning curves and performance analysis.
+Single-experiment plots are auto-generated during training.
+This CLI focuses on comparing multiple experiments.
+
+Usage:
+    python -m utils.visualization exp1 exp2    # Compare experiments
+    python -m utils.visualization --all        # Compare all experiments
+    python -m utils.visualization --list       # List available experiments
+    python -m utils.visualization --regenerate exp1  # Regenerate single plots
 """
 
 import json
@@ -63,7 +70,7 @@ def load_metrics(experiment_name):
 
     Returns:
         pd.DataFrame: Metrics with columns [epoch, train_loss, val_loss,
-                      val_acc_top1, val_acc_top3, lr]
+                      val_acc_top1, lr]
 
     Raises:
         FileNotFoundError: If metrics.csv doesn't exist
@@ -71,7 +78,11 @@ def load_metrics(experiment_name):
     metrics_path = get_results_dir() / experiment_name / "metrics.csv"
     if not metrics_path.exists():
         raise FileNotFoundError(f"No metrics found at {metrics_path}")
-    return pd.read_csv(metrics_path)
+    metrics = pd.read_csv(metrics_path)
+    # Backward compatibility: drop top-3 column if present
+    if 'val_acc_top3' in metrics.columns:
+        metrics = metrics.drop(columns=['val_acc_top3'])
+    return metrics
 
 
 def load_results(experiment_name):
@@ -162,7 +173,7 @@ def plot_loss_curves(experiment_name, save=True, show=False):
 
 def plot_accuracy_curves(experiment_name, save=True, show=False):
     """
-    Plot top-1 and top-3 validation accuracy over epochs.
+    Plot validation accuracy over epochs.
 
     Args:
         experiment_name: Name of the experiment
@@ -178,9 +189,7 @@ def plot_accuracy_curves(experiment_name, save=True, show=False):
         fig, ax = plt.subplots(figsize=(8, 5))
 
         ax.plot(metrics['epoch'], metrics['val_acc_top1'] * 100,
-                color=COLORS[0], linewidth=2, label='Top-1 Accuracy')
-        ax.plot(metrics['epoch'], metrics['val_acc_top3'] * 100,
-                color=COLORS[2], linewidth=2, label='Top-3 Accuracy')
+                color=COLORS[0], linewidth=2, label='Validation Accuracy')
 
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Accuracy (%)')
@@ -243,6 +252,73 @@ def plot_learning_rate(experiment_name, save=True, show=False):
     return fig
 
 
+def plot_confusion_matrix(all_targets, all_predictions, class_names,
+                          results_dir, save=True, show=False):
+    """
+    Generate and save a confusion matrix plot.
+
+    Args:
+        all_targets: List/array of true labels
+        all_predictions: List/array of predicted labels
+        class_names: List of class names for axis labels
+        results_dir: Path to save the figure
+        save: Whether to save the figure
+        show: Whether to display the figure
+
+    Returns:
+        matplotlib.figure.Figure: The generated figure
+    """
+    import numpy as np
+
+    # Compute confusion matrix
+    num_classes = len(class_names)
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for t, p in zip(all_targets, all_predictions):
+        cm[t, p] += 1
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # Create heatmap
+        im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+        ax.figure.colorbar(im, ax=ax)
+
+        # Set labels
+        ax.set(xticks=np.arange(num_classes),
+               yticks=np.arange(num_classes),
+               xticklabels=class_names,
+               yticklabels=class_names,
+               xlabel='Predicted Label',
+               ylabel='True Label',
+               title='Confusion Matrix (Test Set)')
+
+        # Rotate x labels for readability
+        plt.setp(ax.get_xticklabels(), rotation=45, ha='right',
+                 rotation_mode='anchor')
+
+        # Add text annotations
+        thresh = cm.max() / 2.0
+        for i in range(num_classes):
+            for j in range(num_classes):
+                ax.text(j, i, format(cm[i, j], 'd'),
+                        ha='center', va='center',
+                        color='white' if cm[i, j] > thresh else 'black')
+
+        plt.tight_layout()
+
+        if save:
+            save_path = Path(results_dir) / "confusion_matrix.png"
+            fig.savefig(save_path)
+            print(f"Saved: {save_path}")
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    return fig
+
+
 def plot_experiment_summary(experiment_name, save=True, show=False):
     """
     Generate a 2x2 grid summarizing all training metrics.
@@ -282,9 +358,7 @@ def plot_experiment_summary(experiment_name, save=True, show=False):
         # Top-right: Accuracy curves
         ax = axes[0, 1]
         ax.plot(metrics['epoch'], metrics['val_acc_top1'] * 100,
-                color=COLORS[0], linewidth=2, label='Top-1')
-        ax.plot(metrics['epoch'], metrics['val_acc_top3'] * 100,
-                color=COLORS[2], linewidth=2, label='Top-3')
+                color=COLORS[0], linewidth=2, label='Validation Accuracy')
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Accuracy (%)')
         ax.set_title('Validation Accuracy')
@@ -307,10 +381,8 @@ def plot_experiment_summary(experiment_name, save=True, show=False):
         if has_results:
             table_data = [
                 ['Metric', 'Value'],
-                ['Best Val Top-1', f"{results['best_val_acc_top1']:.2%}"],
-                ['Best Val Top-3', f"{results['best_val_acc_top3']:.2%}"],
-                ['Test Top-1', f"{results['final_test_acc_top1']:.2%}"],
-                ['Test Top-3', f"{results['final_test_acc_top3']:.2%}"],
+                ['Best Val Acc', f"{results['best_val_acc_top1']:.2%}"],
+                ['Test Acc', f"{results['final_test_acc_top1']:.2%}"],
                 ['Best Epoch', str(results['best_epoch'])],
                 ['Inference (ms)', f"{results['inference_time_ms']:.2f}"],
                 ['Total Params', f"{results['total_params']:,}"],
@@ -479,26 +551,20 @@ def plot_model_comparison_bar(experiment_names, save=True, show=False):
     with plt.rc_context(PLOT_STYLE):
         fig, axes = plt.subplots(1, 3, figsize=(14, 5))
 
-        x = range(len(valid_names))
+        x_pos = range(len(valid_names))
         bar_width = 0.6
 
-        # Test accuracy (Top-1 and Top-3)
+        # Test accuracy
         ax = axes[0]
-        top1_vals = [r['final_test_acc_top1'] * 100 for r in results_list]
-        top3_vals = [r['final_test_acc_top3'] * 100 for r in results_list]
+        acc_vals = [r['final_test_acc_top1'] * 100 for r in results_list]
 
-        x_pos = range(len(valid_names))
-        ax.bar([p - 0.15 for p in x_pos], top1_vals, width=0.3,
-               color=COLORS[0], label='Top-1')
-        ax.bar([p + 0.15 for p in x_pos], top3_vals, width=0.3,
-               color=COLORS[2], label='Top-3')
+        ax.bar(x_pos, acc_vals, width=bar_width, color=COLORS[0])
 
         ax.set_xlabel('Model')
         ax.set_ylabel('Accuracy (%)')
         ax.set_title('Test Accuracy')
         ax.set_xticks(x_pos)
         ax.set_xticklabels(valid_names, rotation=45, ha='right')
-        ax.legend()
         ax.set_ylim(0, 105)
 
         # Inference time
@@ -543,27 +609,33 @@ def plot_model_comparison_bar(experiment_names, save=True, show=False):
 
 
 def main():
-    """Command-line interface for visualization module."""
+    """Command-line interface for comparing experiments."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Visualize training metrics and compare model performance'
+        description='Compare training results across multiple experiments. '
+                    'Single-experiment plots are auto-generated during training.'
     )
     parser.add_argument(
-        'experiment',
-        nargs='?',
-        help='Experiment name to visualize'
-    )
-    parser.add_argument(
-        '--compare',
-        nargs='+',
+        'experiments',
+        nargs='*',
         metavar='EXP',
-        help='Compare multiple experiments'
+        help='Experiment names to compare (requires 2+)'
+    )
+    parser.add_argument(
+        '--all',
+        action='store_true',
+        help='Compare all available experiments'
     )
     parser.add_argument(
         '--list',
         action='store_true',
         help='List all available experiments'
+    )
+    parser.add_argument(
+        '--regenerate',
+        metavar='EXP',
+        help='Regenerate single-experiment plots for a specific experiment'
     )
     parser.add_argument(
         '--show',
@@ -583,24 +655,42 @@ def main():
             print("No experiments found in results/")
         return
 
-    if args.compare:
-        print(f"Comparing experiments: {', '.join(args.compare)}")
-        plot_loss_comparison(args.compare, save=True, show=args.show)
-        plot_accuracy_comparison(args.compare, save=True, show=args.show)
-        plot_model_comparison_bar(args.compare, save=True, show=args.show)
-        print("\nComparison plots saved to results/comparisons/")
+    # Regenerate single-experiment plots
+    if args.regenerate:
+        print(f"Regenerating plots for: {args.regenerate}")
+        plot_loss_curves(args.regenerate, save=True, show=args.show)
+        plot_accuracy_curves(args.regenerate, save=True, show=args.show)
+        plot_learning_rate(args.regenerate, save=True, show=args.show)
+        plot_experiment_summary(args.regenerate, save=True, show=args.show)
+        print(f"\nPlots saved to results/{args.regenerate}/")
         return
 
-    if args.experiment:
-        print(f"Generating plots for: {args.experiment}")
-        plot_loss_curves(args.experiment, save=True, show=args.show)
-        plot_accuracy_curves(args.experiment, save=True, show=args.show)
-        plot_learning_rate(args.experiment, save=True, show=args.show)
-        plot_experiment_summary(args.experiment, save=True, show=args.show)
-        print(f"\nPlots saved to results/{args.experiment}/")
+    # Determine experiments to compare
+    if args.all:
+        experiments = discover_experiments()
+        if not experiments:
+            print("No experiments found in results/")
+            return
+    elif args.experiments:
+        experiments = args.experiments
+    else:
+        parser.print_help()
+        print("\nExamples:")
+        print("  python -m utils.visualization exp1 exp2     # Compare experiments")
+        print("  python -m utils.visualization --all         # Compare all experiments")
+        print("  python -m utils.visualization --regenerate exp1  # Regenerate plots")
         return
 
-    parser.print_help()
+    if len(experiments) < 2:
+        print("Error: Need at least 2 experiments to compare")
+        print("Use --regenerate for single-experiment plots")
+        return
+
+    print(f"Comparing experiments: {', '.join(experiments)}")
+    plot_loss_comparison(experiments, save=True, show=args.show)
+    plot_accuracy_comparison(experiments, save=True, show=args.show)
+    plot_model_comparison_bar(experiments, save=True, show=args.show)
+    print("\nComparison plots saved to results/comparisons/")
 
 
 if __name__ == '__main__':
