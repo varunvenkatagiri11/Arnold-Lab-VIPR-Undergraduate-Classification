@@ -12,6 +12,9 @@ import random
 import csv
 from pathlib import Path
 
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for SLURM/headless
+
 import torch
 import torch.nn as nn
 from torch.amp.grad_scaler import GradScaler
@@ -25,6 +28,13 @@ from .model_utils import (
     _get_classifier_attr,
     get_backbone_blocks,
     thaw_backbone_percentage,
+)
+from .visualization import (
+    plot_loss_curves,
+    plot_accuracy_curves,
+    plot_learning_rate,
+    plot_experiment_summary,
+    plot_confusion_matrix,
 )
 
 
@@ -274,31 +284,21 @@ def check_thaw_schedule(epoch, options):
 # ---------------------------------------------------------------------------
 
 
-def compute_accuracy(outputs, targets, topk=(1, 3)):
+def compute_accuracy(outputs, targets):
     """
-    Compute top-k accuracy for the specified values of k.
+    Compute top-1 accuracy.
 
     Args:
         outputs: Model logits [batch_size, num_classes]
         targets: Ground truth labels [batch_size]
-        topk: Tuple of k values to compute
 
     Returns:
-        list: Accuracies for each k value (as floats 0-1)
+        float: Top-1 accuracy (0-1)
     """
-    maxk = max(topk)
     batch_size = targets.size(0)
-
-    _, pred = outputs.topk(maxk, dim=1, largest=True, sorted=True)
-    pred = pred.t()
-    correct = pred.eq(targets.view(1, -1).expand_as(pred))
-
-    results = []
-    for k in topk:
-        correct_k = correct[:k].reshape(-1).float().sum(0)
-        results.append(correct_k / batch_size)
-
-    return results
+    _, pred = outputs.topk(1, dim=1, largest=True, sorted=True)
+    correct = pred.eq(targets.view(-1, 1)).sum()
+    return (correct / batch_size).item()
 
 
 # ---------------------------------------------------------------------------
@@ -342,12 +342,11 @@ def evaluate(model, loader, criterion, device):
     Evaluate model on a dataloader.
 
     Returns:
-        dict: {'loss': float, 'acc_top1': float, 'acc_top3': float}
+        dict: {'loss': float, 'acc_top1': float}
     """
     model.eval()
     total_loss = 0.0
     total_top1 = 0.0
-    total_top3 = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -358,18 +357,46 @@ def evaluate(model, loader, criterion, device):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
 
-            top1, top3 = compute_accuracy(outputs, targets, topk=(1, 3))
+            top1 = compute_accuracy(outputs, targets)
 
             total_loss += loss.item()
-            total_top1 += top1.item()
-            total_top3 += top3.item()
+            total_top1 += top1
             num_batches += 1
 
     return {
         "loss": total_loss / num_batches,
         "acc_top1": total_top1 / num_batches,
-        "acc_top3": total_top3 / num_batches,
     }
+
+
+def evaluate_with_predictions(model, loader, device):
+    """
+    Evaluate model and collect all predictions for confusion matrix.
+
+    Args:
+        model: The model to evaluate
+        loader: DataLoader for evaluation
+        device: Device to run on
+
+    Returns:
+        tuple: (all_targets, all_predictions) as lists
+    """
+    model.eval()
+    all_targets = []
+    all_predictions = []
+
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            with autocast("cuda"):
+                outputs = model(inputs)
+
+            _, predicted = outputs.max(1)
+            all_targets.extend(targets.cpu().tolist())
+            all_predictions.extend(predicted.cpu().tolist())
+
+    return all_targets, all_predictions
 
 
 # ---------------------------------------------------------------------------
@@ -431,9 +458,7 @@ def init_metrics_file(results_dir):
     metrics_path = results_dir / "metrics.csv"
     with open(metrics_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            ["epoch", "train_loss", "val_loss", "val_acc_top1", "val_acc_top3", "lr"]
-        )
+        writer.writerow(["epoch", "train_loss", "val_loss", "val_acc_top1", "lr"])
     return metrics_path
 
 
@@ -447,7 +472,6 @@ def append_metrics(metrics_path, epoch, train_loss, val_metrics, lr):
                 f"{train_loss:.4f}",
                 f"{val_metrics['loss']:.4f}",
                 f"{val_metrics['acc_top1']:.4f}",
-                f"{val_metrics['acc_top3']:.4f}",
                 f"{lr:.6f}",
             ]
         )
@@ -521,8 +545,7 @@ def print_epoch_summary(epoch, epochs, train_loss, val_metrics, lr, is_best):
         f"Epoch {epoch:3d}/{epochs} | "
         f"Train Loss: {train_loss:.4f} | "
         f"Val Loss: {val_metrics['loss']:.4f} | "
-        f"Val Top-1: {val_metrics['acc_top1']:.2%} | "
-        f"Val Top-3: {val_metrics['acc_top3']:.2%} | "
+        f"Val Acc: {val_metrics['acc_top1']:.2%} | "
         f"LR: {lr:.6f}{best_marker}"
     )
 
@@ -532,11 +555,9 @@ def print_final_results(results):
     print("\n" + "=" * 60)
     print("FINAL RESULTS")
     print("=" * 60)
-    print(f"Best Validation Accuracy (Top-1): {results['best_val_acc_top1']:.2%}")
-    print(f"Best Validation Accuracy (Top-3): {results['best_val_acc_top3']:.2%}")
+    print(f"Best Validation Accuracy: {results['best_val_acc_top1']:.2%}")
     print(f"Best Epoch: {results['best_epoch']}")
-    print(f"Test Accuracy (Top-1): {results['final_test_acc_top1']:.2%}")
-    print(f"Test Accuracy (Top-3): {results['final_test_acc_top3']:.2%}")
+    print(f"Test Accuracy: {results['final_test_acc_top1']:.2%}")
     print(f"Inference Time: {results['inference_time_ms']:.2f} ms")
     print(f"Total Parameters: {results['total_params']:,}")
     print(f"Trainable Parameters: {results['trainable_params']:,}")
@@ -603,7 +624,6 @@ def train_model(options):
 
     # Training state
     best_val_acc_top1 = 0.0
-    best_val_acc_top3 = 0.0
     best_epoch = 0
 
     # Training loop
@@ -638,7 +658,6 @@ def train_model(options):
 
         if is_best:
             best_val_acc_top1 = val_metrics["acc_top1"]
-            best_val_acc_top3 = val_metrics["acc_top3"]
             best_epoch = epoch
             save_checkpoint(model, results_dir)
 
@@ -663,10 +682,8 @@ def train_model(options):
     results = {
         "experiment_name": experiment_name,
         "best_val_acc_top1": best_val_acc_top1,
-        "best_val_acc_top3": best_val_acc_top3,
         "best_epoch": best_epoch,
         "final_test_acc_top1": test_metrics["acc_top1"],
-        "final_test_acc_top3": test_metrics["acc_top3"],
         "inference_time_ms": inference_time,
         "total_params": total_params,
         "trainable_params": trainable_params,
@@ -678,5 +695,31 @@ def train_model(options):
     results_path = results_dir / "results.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
+
+    # Generate visualizations
+    print("\n[Visualization] Generating training plots...")
+    try:
+        plot_loss_curves(experiment_name, save=True, show=False)
+        plot_accuracy_curves(experiment_name, save=True, show=False)
+        plot_learning_rate(experiment_name, save=True, show=False)
+        plot_experiment_summary(experiment_name, save=True, show=False)
+
+        # Confusion matrix on test set
+        all_targets, all_predictions = evaluate_with_predictions(
+            model, test_loader, device
+        )
+        # Get class names from ImageFolder dataset
+        class_names = getattr(test_loader.dataset, 'classes', None)
+        if class_names is None:
+            num_classes = options["model"]["num_classes"]
+            class_names = [f"Class {i}" for i in range(num_classes)]
+        plot_confusion_matrix(
+            all_targets, all_predictions, class_names,
+            results_dir, save=True, show=False
+        )
+
+        print(f"[Visualization] All plots saved to {results_dir}")
+    except Exception as e:
+        print(f"[Warning] Visualization failed: {e}")
 
     return results
