@@ -1,0 +1,74 @@
+#!/bin/bash
+
+#SBATCH --job-name=vipr_optuna
+#SBATCH --partition=gpu_p
+#SBATCH --gres=gpu:A100:1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=48:00:00
+#SBATCH --output=vipr_optuna_%j.out
+#SBATCH --error=vipr_optuna_%j.err
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=hl98745@uga.edu
+
+echo "======================================================================"
+echo "VIPR CLASSIFICATION - OPTUNA HYPERPARAMETER OPTIMIZATION"
+echo "======================================================================"
+echo "Job started on $(hostname) at $(date)"
+echo "Job ID: $SLURM_JOB_ID"
+echo "======================================================================"
+
+# Navigate to project directory
+cd $SLURM_SUBMIT_DIR
+
+# Print GPU info
+echo ""
+echo "GPU Information:"
+nvidia-smi
+echo ""
+
+# Load required modules
+echo "Loading modules..."
+module load Python/3.10.4-GCCcore-11.3.0
+module load CUDA/11.7.0
+module load cuDNN/8.4.1.50-CUDA-11.7.0
+
+# Activate virtual environment
+echo ""
+echo "Activating virtual environment..."
+source /scratch/hl98745/scratch_venv/bin/activate
+
+# Verify Python and PyTorch
+echo ""
+echo "Python: $(which python)"
+echo "PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
+echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
+echo "Optuna version: $(python -c 'import optuna; print(optuna.__version__)')"
+echo ""
+
+# Get config file from argument, default to resnet152_sweep.json
+CONFIG_FILE="${1:-configs/optuna/resnet152_sweep.json}"
+RESUME_FLAG="${2:-}"
+
+echo "======================================================================"
+echo "Starting Optuna optimization with config: $CONFIG_FILE"
+if [ "$RESUME_FLAG" == "--resume" ]; then
+    echo "Mode: RESUME existing study"
+else
+    echo "Mode: NEW study"
+fi
+echo "======================================================================"
+echo ""
+
+# Run Optuna optimization
+if [ "$RESUME_FLAG" == "--resume" ]; then
+    python run_optuna.py "$CONFIG_FILE" --resume
+else
+    python run_optuna.py "$CONFIG_FILE"
+fi
+
+echo ""
+echo "======================================================================"
+echo "Optuna job finished at $(date)"
+echo "======================================================================"
