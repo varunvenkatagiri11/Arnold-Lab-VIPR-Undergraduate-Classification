@@ -1,7 +1,7 @@
 {
-    "experiment_name": "inception_v3_frozen",
+    "experiment_name": "efficientnet_b4_frozen",
     "model": {
-        "backbone": "inception_v3",
+        "backbone": "efficientnet_b4",
         "pretrained": true,
         "freeze_backbone": true,
         "classifier_hidden": [1024],
@@ -9,7 +9,7 @@
     },
     "data": {
         "path": "/scratch/hl98745/data/final_split_dataset",
-        "input_size": 299,
+        "input_size": 380,
         "batch_size": 32,
         "num_workers": 8
     },

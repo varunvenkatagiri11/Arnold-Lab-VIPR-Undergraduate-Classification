@@ -302,6 +302,54 @@ def compute_accuracy(outputs, targets):
 
 
 # ---------------------------------------------------------------------------
+# Per-Class Metric Computation
+# ---------------------------------------------------------------------------
+
+
+def compute_per_class_metrics(targets, predictions, num_classes):
+    """
+    Compute per-class and macro-averaged classification metrics without sklearn.
+
+    Args:
+        targets: list of ground-truth class indices
+        predictions: list of predicted class indices
+        num_classes: total number of classes
+
+    Returns:
+        tuple:
+            per_class_acc  (list[float]) – per-class recall / accuracy
+            per_class_f1   (list[float]) – per-class F1 score
+            per_class_prec (list[float]) – per-class precision
+            per_class_rec  (list[float]) – per-class recall (same as acc)
+            macro_f1       (float)
+            macro_precision(float)
+            macro_recall   (float)
+    """
+    cm = [[0] * num_classes for _ in range(num_classes)]
+    for t, p in zip(targets, predictions):
+        cm[t][p] += 1
+
+    acc_list, f1_list, prec_list, rec_list = [], [], [], []
+    for i in range(num_classes):
+        tp = cm[i][i]
+        fn = sum(cm[i]) - tp
+        fp = sum(cm[r][i] for r in range(num_classes)) - tp
+        acc  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        acc_list.append(acc)
+        f1_list.append(f1)
+        prec_list.append(prec)
+        rec_list.append(rec)
+
+    macro_f1   = sum(f1_list)   / num_classes
+    macro_prec = sum(prec_list) / num_classes
+    macro_rec  = sum(rec_list)  / num_classes
+    return acc_list, f1_list, prec_list, rec_list, macro_f1, macro_prec, macro_rec
+
+
+# ---------------------------------------------------------------------------
 # Training and Evaluation Loops
 # ---------------------------------------------------------------------------
 
@@ -399,6 +447,72 @@ def evaluate_with_predictions(model, loader, device):
     return all_targets, all_predictions
 
 
+def evaluate_full(model, loader, criterion, device, class_names):
+    """
+    Evaluate model with full per-class and macro metrics in a single pass.
+
+    Collects all predictions, computes loss and accuracy as usual, then
+    derives per-class accuracy, per-class F1, and macro F1/precision/recall
+    via compute_per_class_metrics.
+
+    Args:
+        model: The model to evaluate
+        loader: DataLoader for evaluation
+        criterion: Loss function
+        device: Device to run on
+        class_names: List of class name strings (from dataset.classes)
+
+    Returns:
+        dict with keys:
+            loss           (float)
+            acc_top1       (float) – overall accuracy
+            per_class_acc  (dict)  – {class_name: float}
+            per_class_f1   (dict)  – {class_name: float}
+            macro_f1       (float)
+            macro_precision(float)
+            macro_recall   (float)
+    """
+    model.eval()
+    total_loss = 0.0
+    all_targets = []
+    all_predictions = []
+    num_batches = 0
+
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            with autocast("cuda"):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+
+            _, predicted = outputs.max(1)
+            total_loss += loss.item()
+            num_batches += 1
+            all_targets.extend(targets.cpu().tolist())
+            all_predictions.extend(predicted.cpu().tolist())
+
+    num_classes = len(class_names)
+    overall_acc = sum(t == p for t, p in zip(all_targets, all_predictions)) / len(all_targets)
+
+    acc_list, f1_list, _, _, macro_f1, macro_prec, macro_rec = compute_per_class_metrics(
+        all_targets, all_predictions, num_classes
+    )
+
+    per_class_acc = {class_names[i].lower(): acc_list[i] for i in range(num_classes)}
+    per_class_f1  = {class_names[i].lower(): f1_list[i]  for i in range(num_classes)}
+
+    return {
+        "loss":            total_loss / num_batches,
+        "acc_top1":        overall_acc,
+        "per_class_acc":   per_class_acc,
+        "per_class_f1":    per_class_f1,
+        "macro_f1":        macro_f1,
+        "macro_precision": macro_prec,
+        "macro_recall":    macro_rec,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Inference Time Measurement
 # ---------------------------------------------------------------------------
@@ -453,28 +567,39 @@ def save_config(options, results_dir):
         json.dump(options, f, indent=2)
 
 
-def init_metrics_file(results_dir):
-    """Initialize the metrics CSV file with headers."""
+def init_metrics_file(results_dir, class_names):
+    """Initialize the metrics CSV file with headers.
+
+    Columns: epoch, train_loss, val_loss, val_acc_top1, lr,
+             val_f1_<class> * N, val_acc_<class> * N
+    """
     metrics_path = results_dir / "metrics.csv"
+    headers = ["epoch", "train_loss", "val_loss", "val_acc_top1", "lr"]
+    headers += [f"val_f1_{c.lower()}"  for c in class_names]
+    headers += [f"val_acc_{c.lower()}" for c in class_names]
     with open(metrics_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_loss", "val_acc_top1", "lr"])
+        writer.writerow(headers)
     return metrics_path
 
 
-def append_metrics(metrics_path, epoch, train_loss, val_metrics, lr):
+def append_metrics(metrics_path, epoch, train_loss, val_metrics, lr, class_names):
     """Append one row of metrics to the CSV file."""
+    row = [
+        epoch,
+        f"{train_loss:.4f}",
+        f"{val_metrics['loss']:.4f}",
+        f"{val_metrics['acc_top1']:.4f}",
+        f"{lr:.6f}",
+    ]
+    # Per-class F1 then per-class accuracy, in class_names order
+    for c in class_names:
+        row.append(f"{val_metrics['per_class_f1'][c.lower()]:.4f}")
+    for c in class_names:
+        row.append(f"{val_metrics['per_class_acc'][c.lower()]:.4f}")
     with open(metrics_path, "a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            [
-                epoch,
-                f"{train_loss:.4f}",
-                f"{val_metrics['loss']:.4f}",
-                f"{val_metrics['acc_top1']:.4f}",
-                f"{lr:.6f}",
-            ]
-        )
+        writer.writerow(row)
 
 
 def save_checkpoint(model, results_dir, filename="best_model.pth"):
@@ -557,7 +682,10 @@ def print_final_results(results):
     print("=" * 60)
     print(f"Best Validation Accuracy: {results['best_val_acc_top1']:.2%}")
     print(f"Best Epoch: {results['best_epoch']}")
-    print(f"Test Accuracy: {results['final_test_acc_top1']:.2%}")
+    print(f"Test Accuracy:  {results['final_test_acc_top1']:.2%}")
+    print(f"Test F1 (macro):        {results['final_test_f1']:.4f}")
+    print(f"Test Precision (macro): {results['final_test_precision']:.4f}")
+    print(f"Test Recall (macro):    {results['final_test_recall']:.4f}")
     print(f"Inference Time: {results['inference_time_ms']:.2f} ms")
     print(f"Total Parameters: {results['total_params']:,}")
     print(f"Trainable Parameters: {results['trainable_params']:,}")
@@ -609,10 +737,15 @@ def train_model(options, trial=None, results_dir_override=None):
     else:
         results_dir = create_results_dir(experiment_name)
     save_config(options, results_dir)
-    metrics_path = init_metrics_file(results_dir)
 
     # Data
     train_loader, val_loader, test_loader = create_dataloaders(options)
+    class_names = getattr(train_loader.dataset, "classes", None)
+    if class_names is None:
+        num_classes = options["model"]["num_classes"]
+        class_names = [f"class{i}" for i in range(num_classes)]
+
+    metrics_path = init_metrics_file(results_dir, class_names)
 
     # Model
     model = load_model(options)
@@ -661,7 +794,7 @@ def train_model(options, trial=None, results_dir_override=None):
             model, train_loader, criterion, optimizer, scheduler, scaler, device
         )
 
-        val_metrics = evaluate(model, val_loader, criterion, device)
+        val_metrics = evaluate_full(model, val_loader, criterion, device, class_names)
 
         # Optuna pruning check
         if trial is not None:
@@ -678,7 +811,7 @@ def train_model(options, trial=None, results_dir_override=None):
             best_epoch = epoch
             save_checkpoint(model, results_dir)
 
-        append_metrics(metrics_path, epoch, train_loss, val_metrics, current_lr)
+        append_metrics(metrics_path, epoch, train_loss, val_metrics, current_lr, class_names)
         print_epoch_summary(epoch, epochs, train_loss, val_metrics, current_lr, is_best)
 
         if early_stopping.should_stop:
@@ -687,7 +820,7 @@ def train_model(options, trial=None, results_dir_override=None):
 
     # Load best model and evaluate on test set
     load_checkpoint(model, results_dir)
-    test_metrics = evaluate(model, test_loader, criterion, device)
+    test_metrics = evaluate_full(model, test_loader, criterion, device, class_names)
 
     # Measure inference time
     input_size = options["data"]["input_size"]
@@ -701,9 +834,14 @@ def train_model(options, trial=None, results_dir_override=None):
         "best_val_acc_top1": best_val_acc_top1,
         "best_epoch": best_epoch,
         "final_test_acc_top1": test_metrics["acc_top1"],
+        "final_test_f1": test_metrics["macro_f1"],
+        "final_test_precision": test_metrics["macro_precision"],
+        "final_test_recall": test_metrics["macro_recall"],
         "inference_time_ms": inference_time,
         "total_params": total_params,
         "trainable_params": trainable_params,
+        "per_class_test_f1": test_metrics["per_class_f1"],
+        "per_class_test_acc": test_metrics["per_class_acc"],
     }
 
     print_final_results(results)
