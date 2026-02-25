@@ -343,7 +343,8 @@ def get_resolution_probe(model, input_shape=(3, 224, 224)):
         if len(list(module.children())) == 0:
             hooks.append(module.register_forward_hook(hook_fn))
 
-    dummy = torch.zeros(1, *input_shape)
+    device = next(model.parameters()).device
+    dummy = torch.zeros(1, *input_shape).to(device)
     with torch.no_grad():
         try:
             model(dummy)
