@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from utils.visualization import COLORS, PLOT_STYLE
+from utils.visualization import COLORS, IEEE_PLOT_STYLE as PLOT_STYLE
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +166,14 @@ def chart_02_bubble_size_accuracy(study_data, labels, output_dir):
         return
 
     times = np.array([e["time_ms"] for e in entries])
-    max_t = times.max() if times.max() > 0 else 1.0
-    sizes = (times / max_t) * 1800 + 200  # scale to [200, 2000]
+    # Log-scale bubble sizes so large inference-time differences don't dominate;
+    # maps log(1+t) linearly into [100, 1600] marker area units.
+    log_times = np.log1p(times)
+    max_log_t = log_times.max() if log_times.max() > 0 else 1.0
+    sizes = (log_times / max_log_t) * 1500 + 100
 
     with plt.rc_context(PLOT_STYLE):
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots(figsize=(10, 6))
 
         scatter_handles = []
         for i, (entry, sz) in enumerate(zip(entries, sizes)):
@@ -186,35 +189,47 @@ def chart_02_bubble_size_accuracy(study_data, labels, output_dir):
                 entry["label"],
                 (entry["params_m"], entry["acc"]),
                 textcoords="offset points",
-                xytext=(8, 4),
+                xytext=(6, 4),
                 fontsize=8,
             )
 
-        # Model color legend
-        model_legend = ax.legend(handles=scatter_handles, loc="lower right",
-                                 title="Model", fontsize=8, title_fontsize=8)
+        # Log scale on x-axis so closely-spaced parameter counts are separable
+        ax.set_xscale("log")
 
-        # Bubble size legend (inference time)
+        # Model color legend — outside the plot to the right
+        model_legend = ax.legend(
+            handles=scatter_handles,
+            loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0,
+            title="Model", fontsize=8, title_fontsize=8,
+        )
+
+        # Bubble size legend (raw inference time values; bubble area is log-scaled)
         if len(entries) >= 2:
             t_min, t_mid, t_max = times.min(), np.median(times), times.max()
-            s_min = (t_min / max_t) * 1800 + 200
-            s_mid = (t_mid / max_t) * 1800 + 200
-            s_max_sz = (t_max / max_t) * 1800 + 200
+            lt_min   = np.log1p(t_min)
+            lt_mid   = np.log1p(t_mid)
+            lt_max   = np.log1p(t_max)
+            s_min    = (lt_min   / max_log_t) * 1500 + 100
+            s_mid    = (lt_mid   / max_log_t) * 1500 + 100
+            s_max_sz = (lt_max   / max_log_t) * 1500 + 100
             size_handles = [
-                ax.scatter([], [], s=s_min, color="gray", alpha=0.6,
-                           label=f"{t_min:.1f} ms"),
-                ax.scatter([], [], s=s_mid, color="gray", alpha=0.6,
-                           label=f"{t_mid:.1f} ms"),
+                ax.scatter([], [], s=s_min,    color="gray", alpha=0.6,
+                           label=f"{t_min:.2f} ms"),
+                ax.scatter([], [], s=s_mid,    color="gray", alpha=0.6,
+                           label=f"{t_mid:.2f} ms"),
                 ax.scatter([], [], s=s_max_sz, color="gray", alpha=0.6,
-                           label=f"{t_max:.1f} ms"),
+                           label=f"{t_max:.2f} ms"),
             ]
-            size_legend = ax.legend(handles=size_handles, loc="upper left",
-                                    title="Inference Time", fontsize=8, title_fontsize=8)
             ax.add_artist(model_legend)
+            fig.legend(
+                handles=size_handles,
+                loc="lower left", bbox_to_anchor=(1.02, 0), borderaxespad=0,
+                title="Inference Time", fontsize=8, title_fontsize=8,
+            )
 
-        ax.set_xlabel("Trainable Parameters (M)")
+        ax.set_xlabel("Trainable Parameters (M, log scale)")
         ax.set_ylabel("Final Test Accuracy (%)")
-        ax.set_title("Model Size vs. Accuracy\n(bubble size = inference time)")
+        ax.set_title("Model Size vs. Accuracy\n(bubble size ∝ log inference time)")
 
         plt.tight_layout()
         save_path = output_dir / "02_size_vs_accuracy.png"
@@ -282,51 +297,114 @@ def chart_03_compound_learning_curves(study_data, labels, output_dir):
 
 
 # ---------------------------------------------------------------------------
-# Chart 4 — Per-Class Learning Curves (one file per study)
+# Chart 4 — Per-Class Compound Learning Curves (top-2 models)
 # ---------------------------------------------------------------------------
 
 
-def chart_04_per_class_curves(study_datum, label, study_name, output_dir):
+def chart_04_class_compound_curves(study_data, labels, output_dir):
     """
-    Per-class validation curves for a single study.
-    Prefers val_f1_{class} columns; falls back to val_acc_{class}.
+    2×2 compound chart with one subplot per class.  Each subplot overlays the
+    val_f1_{class} learning curves for the top-2 models ranked by
+    final_test_acc_top1, with a marker at each model's best epoch.
 
-    Saves: output_dir/04_per_class_curves_{study_name}.png
+    Saves: output_dir/04_per_class_compound_curves.png
     """
-    df = study_datum["metrics"]
-    if df is None:
-        print(f"[Chart 04] Skipping '{label}' — no metrics.csv")
+    # Rank studies that have both metrics and a valid accuracy score
+    ranked = sorted(
+        [
+            (datum, label)
+            for datum, label in zip(study_data, labels)
+            if datum["metrics"] is not None
+            and datum["results"].get("final_test_acc_top1") is not None
+        ],
+        key=lambda x: x[0]["results"]["final_test_acc_top1"],
+        reverse=True,
+    )
+
+    if not ranked:
+        print("[Chart 04] No studies with metrics — skipping")
         return
 
-    f1_cols = [c for c in df.columns if c.startswith("val_f1_")]
-    acc_cols = [c for c in df.columns
-                if c.startswith("val_acc_") and c != "val_acc_top1"]
-    cols = f1_cols if f1_cols else acc_cols
+    top2 = ranked[:2]
 
-    if not cols:
-        print(f"[Chart 04] Skipping '{label}' — no per-class columns in metrics.csv "
-              f"(need val_f1_<class> or val_acc_<class>; re-run with updated trainer)")
+    # Discover class names from val_f1_* columns of the first available study
+    all_classes = []
+    for datum, _ in top2:
+        df = datum["metrics"]
+        for col in df.columns:
+            if col.startswith("val_f1_"):
+                cls = col[len("val_f1_"):]
+                if cls not in all_classes:
+                    all_classes.append(cls)
+        if all_classes:
+            break
+    all_classes = sorted(all_classes)
+
+    if not all_classes:
+        print("[Chart 04] No val_f1_<class> columns found — skipping")
         return
 
-    prefix = "val_f1_" if f1_cols else "val_acc_"
-    y_label = "Validation F1 (%)" if f1_cols else "Validation Accuracy (%)"
-    class_names = [c[len(prefix):] for c in cols]
+    n_classes = len(all_classes)
+    n_cols_grid = 2
+    n_rows_grid = (n_classes + 1) // 2  # ceiling division
+
+    top2_labels = [lbl for _, lbl in top2]
 
     with plt.rc_context(PLOT_STYLE):
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, axes = plt.subplots(
+            n_rows_grid, n_cols_grid,
+            figsize=(11, 4 * n_rows_grid),
+            sharex=False,
+        )
+        axes = np.array(axes).flatten()
 
-        for i, (col, cls) in enumerate(zip(cols, class_names)):
-            ax.plot(df["epoch"], df[col] * 100,
-                    color=COLORS[i % len(COLORS)], linewidth=1.5,
-                    label=cls.replace("_", " ").title())
+        for idx, cls in enumerate(all_classes):
+            ax = axes[idx]
+            col = f"val_f1_{cls}"
 
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel(y_label)
-        ax.set_title(f"Per-Class Validation Curves — {label}")
-        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+            for model_idx, (datum, lbl) in enumerate(top2):
+                df = datum["metrics"]
+                if col not in df.columns:
+                    continue
+                epochs = df["epoch"]
+                values = df[col] * 100
+                color = COLORS[model_idx % len(COLORS)]
+
+                ax.plot(epochs, values, color=color, linewidth=1.5, label=lbl)
+
+                # Mark the best epoch with a filled dot
+                best_epoch = datum["results"].get("best_epoch")
+                if best_epoch is not None and best_epoch in epochs.values:
+                    mask = epochs == best_epoch
+                    best_val = values[mask].values[0]
+                    ax.scatter(best_epoch, best_val, color=color, s=40,
+                               zorder=5, marker="o")
+
+            ax.set_title(cls.replace("_", " ").title())
+            ax.set_ylabel("Validation F1 (%)")
+            # Only label x-axis on the bottom row
+            if idx >= n_classes - n_cols_grid:
+                ax.set_xlabel("Epoch")
+
+        # Hide any unused subplot panels
+        for idx in range(n_classes, len(axes)):
+            axes[idx].set_visible(False)
+
+        # Shared legend above all subplots
+        handles, leg_labels = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles, leg_labels,
+            loc="upper center", ncol=len(top2),
+            bbox_to_anchor=(0.5, 1.02),
+            fontsize=9,
+        )
+        fig.suptitle(
+            "Per-Class Validation F1 — Top-2 Models",
+            fontsize=11, fontweight="bold", y=1.06,
+        )
 
         plt.tight_layout()
-        save_path = output_dir / f"04_per_class_curves_{study_name}.png"
+        save_path = output_dir / "04_per_class_compound_curves.png"
         fig.savefig(save_path, bbox_inches="tight")
         print(f"[Chart 04] Saved: {save_path}")
         plt.close(fig)
@@ -381,6 +459,15 @@ def chart_05_per_class_performance(study_data, labels, output_dir):
             if "per_class_test_f1" in datum["results"]:
                 f1_matrix[i, j] = datum["results"]["per_class_test_f1"].get(cls, np.nan)
 
+    # Compute a dynamic y-axis floor: round the minimum value down to the
+    # nearest 0.05, then subtract 0.05 as a visual buffer.
+    all_vals = np.concatenate([acc_matrix.flatten(), f1_matrix.flatten()])
+    all_vals = all_vals[~np.isnan(all_vals)]
+    if len(all_vals) > 0:
+        y_floor = max(0.0, np.floor(all_vals.min() * 20) / 20 - 0.05)
+    else:
+        y_floor = 0.0
+
     bar_width = 0.8 / n_models
     x = np.arange(n_classes)
     fig_w = max(10, n_classes * 1.8)
@@ -402,7 +489,7 @@ def chart_05_per_class_performance(study_data, labels, output_dir):
                        label=valid_labels[i] if subplot_idx == 0 else "_nolegend_")
             ax.set_ylabel(ylabel)
             ax.set_title(title)
-            ax.set_ylim(0, 1.05)
+            ax.set_ylim(y_floor, 1.05)
 
         axes[-1].set_xticks(x)
         axes[-1].set_xticklabels(
@@ -426,65 +513,7 @@ def chart_05_per_class_performance(study_data, labels, output_dir):
 
 
 # ---------------------------------------------------------------------------
-# Chart 6 — Performance Overview per Study (top-5 trials)
-# ---------------------------------------------------------------------------
-
-
-def chart_06_performance_overview(study_datum, label, study_name, output_dir):
-    """
-    Grouped bar chart of aggregate metrics (acc, F1, precision, recall) for a
-    single study's best trial.
-
-    Saves: output_dir/06_performance_overview_{study_name}.png
-    """
-    r = study_datum["results"]
-
-    metric_keys = [
-        ("final_test_acc_top1", "Test Acc"),
-        ("final_test_f1",       "Macro F1"),
-        ("final_test_precision","Precision"),
-        ("final_test_recall",   "Recall"),
-    ]
-    available = [(key, mname) for key, mname in metric_keys if key in r]
-
-    if not available:
-        print(f"[Chart 06] Skipping '{label}' — no aggregate metric keys in results.json "
-              f"(re-run with updated trainer.py)")
-        return
-
-    metric_names = [mname for _, mname in available]
-    values = [r[key] for key, _ in available]
-    x_pos = np.arange(len(available))
-
-    with plt.rc_context(PLOT_STYLE):
-        fig, ax = plt.subplots(figsize=(6, 5))
-
-        bars = ax.bar(x_pos, values, width=0.5,
-                      color=[COLORS[i % len(COLORS)] for i in range(len(available))])
-
-        for bar, val in zip(bars, values):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.005,
-                f"{val:.4f}",
-                ha="center", va="bottom", fontsize=9,
-            )
-
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels(metric_names)
-        ax.set_ylabel("Performance")
-        ax.set_ylim(0, 1.08)
-        ax.set_title(f"Performance Overview — {label}")
-
-        plt.tight_layout()
-        save_path = output_dir / f"06_performance_overview_{study_name}.png"
-        fig.savefig(save_path, bbox_inches="tight")
-        print(f"[Chart 06] Saved: {save_path}")
-        plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Chart 7 — Summary Table (PNG + CSV)
+# Chart 6 — Summary Table (PNG + CSV)
 # ---------------------------------------------------------------------------
 
 
@@ -600,7 +629,7 @@ def chart_07_summary_table(study_data, labels, output_dir):
 
 def generate_all_charts(study_names, labels, output_dir, study_dir):
     """
-    Load all study data and generate all 7 chart types.
+    Load all study data and generate all 6 chart types.
 
     Args:
         study_names: list of Optuna study directory names
@@ -630,18 +659,13 @@ def generate_all_charts(study_names, labels, output_dir, study_dir):
     # Chart 3 — Compound learning curves
     chart_03_compound_learning_curves(study_data, labels, output_dir)
 
-    # Chart 4 — Per-class learning curves (one file per study)
-    for datum, name, label in zip(study_data, study_names, labels):
-        chart_04_per_class_curves(datum, label, name, output_dir)
+    # Chart 4 — Per-class compound learning curves (top-2 models, 2×2 grid)
+    chart_04_class_compound_curves(study_data, labels, output_dir)
 
     # Chart 5 — Per-class performance bar chart
     chart_05_per_class_performance(study_data, labels, output_dir)
 
-    # Chart 6 — Performance overview per study (best trial metrics)
-    for datum, name, label in zip(study_data, study_names, labels):
-        chart_06_performance_overview(datum, label, name, output_dir)
-
-    # Chart 7 — Summary table (PNG + CSV)
+    # Chart 6 — Summary table (PNG + CSV)
     chart_07_summary_table(study_data, labels, output_dir)
 
     print(f"\n[Charts] Done. All figures saved to: {output_dir}")

@@ -17,6 +17,7 @@ from .visualization import (
     plot_loss_comparison,
     plot_accuracy_comparison,
     plot_model_comparison_bar,
+    IEEE_PLOT_STYLE,
 )
 
 # Optuna utilities (optional, only available when optuna is installed)
