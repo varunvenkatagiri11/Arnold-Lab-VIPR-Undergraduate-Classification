@@ -11,6 +11,7 @@ import time
 import random
 import csv
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for SLURM/headless
@@ -28,6 +29,9 @@ from .model_utils import (
     _get_classifier_attr,
     get_backbone_blocks,
     thaw_backbone_percentage,
+    get_unfreeze_units,
+    thaw_units,
+    UnfreezeUnit,
 )
 from .visualization import (
     plot_loss_curves,
@@ -183,7 +187,7 @@ def create_dataloaders(options):
 # ---------------------------------------------------------------------------
 
 
-def create_optimizer(model, options, backbone_name=None):
+def create_optimizer(model, options, backbone_name=None, dynamic_unfreeze_mode=False):
     """
     Create optimizer from config with optional discriminative learning rates.
 
@@ -192,10 +196,15 @@ def create_optimizer(model, options, backbone_name=None):
     Includes ALL parameters (even frozen ones) to preserve momentum state
     when thawing layers mid-training.
 
+    When dynamic_unfreeze_mode=True, only the classifier params are included
+    at startup. Backbone units are added later via optimizer.add_param_group()
+    as they are unfrozen, giving each unit a fresh optimizer state.
+
     Args:
         model: The model
         options: Config dict
         backbone_name: If provided, enables discriminative LR setup
+        dynamic_unfreeze_mode: If True, start with classifier params only.
 
     Returns:
         torch.optim.Optimizer
@@ -206,8 +215,15 @@ def create_optimizer(model, options, backbone_name=None):
     optimizer_name = train_opts.get("optimizer", "adamw").lower()
     thaw_schedule = train_opts.get("thaw_schedule")
 
-    # Use discriminative LR if thaw_schedule is configured
-    if backbone_name and thaw_schedule:
+    if dynamic_unfreeze_mode and backbone_name:
+        # Classifier-only startup; backbone units added incrementally
+        classifier_attr = _get_classifier_attr(backbone_name)
+        classifier = getattr(model, classifier_attr)
+        param_groups = [
+            {'params': list(classifier.parameters()), 'lr': lr, 'name': 'classifier'},
+        ]
+    elif backbone_name and thaw_schedule:
+        # Use discriminative LR if thaw_schedule is configured
         backbone_lr_ratio = train_opts.get("backbone_lr_ratio", 0.1)
         classifier_attr = _get_classifier_attr(backbone_name)
         classifier = getattr(model, classifier_attr)
@@ -659,6 +675,101 @@ class EarlyStopping:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic Thaw Controller
+# ---------------------------------------------------------------------------
+
+
+class DynamicThawController:
+    """
+    Plateau-triggered progressive unfreezing controller.
+
+    Monitors validation loss after each epoch. When the loss fails to
+    improve for `unfreeze_patience` consecutive epochs, the next batch
+    of UnfreezeUnits (ordered output→input) is returned for thawing.
+
+    Each newly unfrozen batch receives a learning rate of:
+        lr = base_lr * lr_decay_ratio ** depth_level
+
+    where depth_level starts at 1 for the first unfrozen batch and
+    increments with each successive trigger.
+
+    Usage::
+
+        controller = DynamicThawController(units, patience=5, size=1,
+                                           lr_decay_ratio=0.1, base_lr=1e-4)
+        for epoch in ...:
+            result = controller.step(val_loss)
+            if result is not None:
+                units_batch, unit_lr = result
+                thaw_units(model, units_batch)
+                optimizer.add_param_group({'params': ..., 'lr': unit_lr})
+    """
+
+    _MIN_DELTA = 0.001  # minimum loss improvement to reset counter
+
+    def __init__(self, units, unfreeze_patience, unfreeze_size, lr_decay_ratio, base_lr):
+        """
+        Args:
+            units: List[UnfreezeUnit] ordered output→input (from get_unfreeze_units).
+            unfreeze_patience: Epochs without val_loss improvement before triggering.
+            unfreeze_size: Number of units to open per trigger.
+            lr_decay_ratio: LR multiplier per depth level (e.g. 0.1).
+            base_lr: Classifier head learning rate (depth-0 reference).
+        """
+        self._units: List[UnfreezeUnit] = list(units)
+        self._patience = unfreeze_patience
+        self._size = unfreeze_size
+        self._decay = lr_decay_ratio
+        self._base_lr = base_lr
+
+        self._best_loss: Optional[float] = None
+        self._counter = 0
+        self._next_idx = 0
+        self._depth_level = 1  # depth 0 = classifier head; backbone starts at 1
+        self.all_unfrozen = False
+
+    def step(self, val_loss: float) -> Optional[Tuple[List[UnfreezeUnit], float]]:
+        """
+        Update controller state with the latest validation loss.
+
+        Args:
+            val_loss: Current epoch validation loss.
+
+        Returns:
+            (units_batch, lr) if a plateau was detected and units remain,
+            otherwise None.
+        """
+        # Track best loss
+        if self._best_loss is None or val_loss < self._best_loss - self._MIN_DELTA:
+            self._best_loss = val_loss
+            self._counter = 0
+            return None
+
+        self._counter += 1
+
+        if self._counter < self._patience:
+            return None
+
+        # Plateau detected — check if units remain
+        if self._next_idx >= len(self._units):
+            self.all_unfrozen = True
+            return None
+
+        # Grab the next batch of units
+        batch = self._units[self._next_idx: self._next_idx + self._size]
+        unit_lr = self._base_lr * (self._decay ** self._depth_level)
+
+        self._next_idx += len(batch)
+        self._depth_level += 1
+        self._counter = 0  # reset counter after unfreeze
+
+        if self._next_idx >= len(self._units):
+            self.all_unfrozen = True
+
+        return batch, unit_lr
+
+
+# ---------------------------------------------------------------------------
 # Console Output
 # ---------------------------------------------------------------------------
 
@@ -753,15 +864,33 @@ def train_model(options, trial=None, results_dir_override=None):
     backbone_name = options['model']['backbone']
 
     # Training components
+    dynamic_unfreeze_opts = options["training"].get("dynamic_unfreeze")
     criterion = nn.CrossEntropyLoss()
-    optimizer = create_optimizer(model, options, backbone_name)
+    optimizer = create_optimizer(
+        model, options, backbone_name,
+        dynamic_unfreeze_mode=bool(dynamic_unfreeze_opts)
+    )
     scheduler = create_scheduler(optimizer, options, len(train_loader))
     scaler = GradScaler("cuda")
 
     # Early stopping
     early_stopping = EarlyStopping(patience=patience)
 
-    # Progressive unfreezing state
+    # Dynamic unfreezing controller (plateau-triggered)
+    thaw_controller = None
+    if dynamic_unfreeze_opts:
+        input_shape = (3, options["data"]["input_size"], options["data"]["input_size"])
+        unfreeze_units = get_unfreeze_units(model, backbone_name, input_shape)
+        print(f"[Dynamic Unfreeze] Detected {len(unfreeze_units)} backbone unit(s).")
+        thaw_controller = DynamicThawController(
+            units=unfreeze_units,
+            unfreeze_patience=dynamic_unfreeze_opts["unfreeze_patience"],
+            unfreeze_size=dynamic_unfreeze_opts["unfreeze_size"],
+            lr_decay_ratio=dynamic_unfreeze_opts["lr_decay_ratio"],
+            base_lr=options["training"]["learning_rate"],
+        )
+
+    # Progressive unfreezing state (epoch-schedule mode)
     current_thaw_pct = 0.0
     thaw_schedule = options["training"].get("thaw_schedule")
 
@@ -795,6 +924,30 @@ def train_model(options, trial=None, results_dir_override=None):
         )
 
         val_metrics = evaluate_full(model, val_loader, criterion, device, class_names)
+
+        # Dynamic plateau-triggered unfreezing
+        if thaw_controller is not None:
+            result = thaw_controller.step(val_metrics["loss"])
+            if result is not None:
+                units_batch, unit_lr = result
+                thaw_units(model, units_batch)
+                new_params = [
+                    p
+                    for unit in units_batch
+                    for name in unit.module_names
+                    for p in model.get_submodule(name).parameters()
+                ]
+                depth = thaw_controller._depth_level - 1  # already incremented in step()
+                optimizer.add_param_group({
+                    'params': new_params,
+                    'lr': unit_lr,
+                    'name': f'backbone_d{depth}',
+                })
+                total, trainable = count_parameters(model)
+                print(
+                    f"\n[Epoch {epoch}] Dynamic unfreeze: {len(units_batch)} unit(s) "
+                    f"@ lr={unit_lr:.2e} | Trainable: {trainable:,}/{total:,}\n"
+                )
 
         # Optuna pruning check
         if trial is not None:

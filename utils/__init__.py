@@ -4,8 +4,16 @@ VIPR Classification Framework
 Utilities for training and evaluating image classification models.
 """
 
-from .model_utils import load_model, count_parameters, BACKBONE_REGISTRY
-from .trainer import train_model
+from .model_utils import (
+    load_model,
+    count_parameters,
+    BACKBONE_REGISTRY,
+    get_resolution_probe,
+    get_unfreeze_units,
+    thaw_units,
+    UnfreezeUnit,
+)
+from .trainer import train_model, DynamicThawController
 from .visualization import (
     load_metrics,
     load_results,
