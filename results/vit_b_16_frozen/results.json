@@ -1,0 +1,24 @@
+{
+  "experiment_name": "vit_b_16_frozen",
+  "best_val_acc_top1": 0.8521897810218978,
+  "best_epoch": 17,
+  "final_test_acc_top1": 0.8752260397830018,
+  "final_test_f1": 0.8660325384681176,
+  "final_test_precision": 0.867055905047764,
+  "final_test_recall": 0.8661453379824697,
+  "inference_time_ms": 4.765213611535728,
+  "total_params": 86590212,
+  "trainable_params": 791556,
+  "per_class_test_f1": {
+    "blurry": 0.811965811965812,
+    "good": 0.9108910891089109,
+    "opaque": 0.8252427184466019,
+    "yellow": 0.9160305343511451
+  },
+  "per_class_test_acc": {
+    "blurry": 0.8407079646017699,
+    "good": 0.9064039408866995,
+    "opaque": 0.794392523364486,
+    "yellow": 0.9230769230769231
+  }
+}
